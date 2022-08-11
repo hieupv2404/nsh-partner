@@ -1,0 +1,96 @@
+variables:
+  GIT_STRATEGY: clone
+  DOCKER_IMAGE_NAME: $DOCKER_REGISTRY/nextpay/$PROJECT_GROUP/$CI_PROJECT_NAME
+  #$CI_SERVICE_CHART_ROOT_SELECTOR: this is CI/CD group variable, all services in the same group should reuse this.
+  CHART_SERVICE_TAG_PATH: $CHART_YAML_SELECTOR.$CI_PROJECT_NAME.image.tag
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+      variables:
+        CHART_GIT_URL: $CHART_DEV_URL
+        CHART_VALUES_FILE: "values-dev.yaml"
+        DOCKER_IMAGE_TAG: "dev-$CI_COMMIT_SHORT_SHA"
+    - if: $CI_COMMIT_TAG
+      variables:
+        CHART_GIT_URL: $CHART_PROD_URL
+        CHART_VALUES_FILE: "values-prod.yaml"
+        DOCKER_IMAGE_TAG: "$CI_COMMIT_TAG"
+
+stages:
+  - build
+  - deploy
+  - verify
+
+build:
+  stage: build
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_TAG
+  before_script:
+    - docker login $DOCKER_REGISTRY -u $DOCKER_REGISTRY_USER -p $DOCKER_REGISTRY_PASSWD
+  script:
+    - >
+      docker build
+      --build-arg REGISTRY_SAOBANG_REPO_USER=$REGISTRY_SAOBANG_REPO_USER
+      --build-arg REGISTRY_SAOBANG_REPO_PASS=$REGISTRY_SAOBANG_REPO_PASS
+      -t $DOCKER_IMAGE_NAME:$DOCKER_IMAGE_TAG .
+    - docker push $DOCKER_IMAGE_NAME:$DOCKER_IMAGE_TAG
+
+deploy:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - rm -rf chart
+  script:
+    - git clone http://$RUNNER_GITLAB_USER:$RUNNER_GITLAB_TOKEN@$CHART_GIT_URL chart && cd chart
+    - >
+      docker run --rm
+      --user="root"
+      -v "${PWD}":/workspace
+      -w /workspace
+      $DOCKER_YQ_IMAGE
+      eval ''$CHART_SERVICE_TAG_PATH' = "'$DOCKER_IMAGE_TAG'"' -i $CHART_VALUES_FILE
+    - git config --global user.email "np-devops@mpos.vn"
+    - git config --global user.name "DevOps Team"
+    - git add .
+    - git commit -m "[BOT] Update $CI_PROJECT_NAME image tag to $DOCKER_IMAGE_TAG"
+    - git push
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_TAG
+      when: manual
+
+verify:
+  tags:
+    - runner-150-16
+  stage: verify
+  retry:
+    max: 2
+  before_script:
+    - docker login $DOCKER_REGISTRY -u $DOCKER_REGISTRY_USER -p $DOCKER_REGISTRY_PASSWD
+  script:
+    - sleep 60
+    - >
+      docker run --rm
+      -e CONFIG_NEXTPAY=$CONFIG_NEXTPAY
+      -e TOKEN_NP_DEVOPS_GITLAB_SAOBANG=$TOKEN_NP_DEVOPS_GITLAB_SAOBANG
+      -e CI_PROJECT_NAME=$CI_PROJECT_NAME
+      -e NAMESPACE=nextshop-v2
+      -e DOCKER_IMAGE_NAME=$DOCKER_IMAGE_NAME
+      -e DOCKER_IMAGE_TAG=$DOCKER_IMAGE_TAG
+      hub.saobang.vn/nextpay-common/kubectl:v0.0.1 /bin/sh -c 'curl -o /root/.kube/config --header "PRIVATE-TOKEN: ${TOKEN_NP_DEVOPS_GITLAB_SAOBANG}" "${CONFIG_NEXTPAY}" &&
+      kubectl get pods -n ${NAMESPACE} &&
+      CHECK_TAG_SRC=$(kubectl get deployment/${CI_PROJECT_NAME} -n ${NAMESPACE} -o jsonpath="{..image}") &&
+      echo "Tag on host: $CHECK_TAG_SRC" &&
+      CHECK_TAG_DEST=${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} &&
+      echo "Tag on git: $CHECK_TAG_DEST" &&
+      if [ "$CHECK_TAG_SRC" != "$CHECK_TAG_DEST" ]; then exit 1; fi &&
+      HTTP_PORT=$(kubectl exec deployment/${CI_PROJECT_NAME} -n ${NAMESPACE} -- env | grep "^HTTP_PORT=" | cut -d"=" -f2-) &&
+      RESULT_LIVENESS=$(kubectl exec deployment/${CI_PROJECT_NAME} -n ${NAMESPACE} -- curl -s -o /dev/null -w "%{http_code}" http://localhost:${HTTP_PORT}/healthcheck/liveness) && echo "Liveness Status Code: $RESULT_LIVENESS" &&
+      if [ "$RESULT_LIVENESS" != "200" ]; then exit 1; fi &&
+      sleep 10 &&
+      RESULT_READINESS=$(kubectl exec deployment/${CI_PROJECT_NAME} -n ${NAMESPACE} -- curl -s -o /dev/null -w "%{http_code}" http://localhost:${HTTP_PORT}/healthcheck/readiness) && echo "Readiness Status Code: $RESULT_READINESS" &&
+      if [ "$RESULT_READINESS" != "200" ]; then exit 1; fi'
+  needs: ['deploy']

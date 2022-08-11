@@ -1,0 +1,15 @@
+server:
+  port: ${HTTP_PORT}
+
+logging:
+  level:
+    ROOT: INFO
+    vn.nextpay.nextshop: ${LOG_LEVEL}
+
+spring:
+  jackson:
+    default-property-inclusion: non_null
+#  data:
+#    mongodb:
+#      uri: ${MONGO_URI}
+spring.main.allow-bean-definition-overriding: true
